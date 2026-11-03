@@ -1,38 +1,44 @@
 /**
- * QX 节点出口 IP 检测（家宽 / 机房判断）
+ * QX 节点入口 + 落地 IP 检测
+ * 风格对齐网络信息查询
  */
 const timeout = 8000;
 
 (async () => {
   try {
-    const ipapi = await fetchJson("http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting");
+    // 1. 获取落地 IP（走当前节点）
+    const exit = await fetchJson("http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting");
     
-    if (!ipapi || ipapi.status !== "success") {
-      throw new Error(ipapi?.message || "ip-api 请求失败");
+    if (!exit || exit.status !== "success") {
+      throw new Error(exit?.message || "落地 IP 获取失败");
     }
 
-    let ippure = null;
+    // 2. 尝试获取入口 IP（节点服务器 IP）
+    let entry = null;
     try {
-      ippure = await fetchJson("https://my.ippure.com/v1/info");
+      // 这里用一个不走代理的接口尝试获取（效果有限，QX 限制较多）
+      entry = await fetchJson("http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as", true);
     } catch (e) {}
 
-    const result = buildResult(ipapi, ippure);
+    const result = buildResult(entry, exit);
     $done({
-      title: "📍 节点出口检测",
+      title: "📍 节点入口/落地检测",
       htmlMessage: result
     });
   } catch (err) {
     $done({
-      title: "📍 节点出口检测",
+      title: "📍 节点入口/落地检测",
       htmlMessage: `<p style="color:#FF3B30">检测失败：${err.message || err}</p>`
     });
   }
 })();
 
-function fetchJson(url) {
+function fetchJson(url, direct = false) {
   return new Promise((resolve, reject) => {
     const opts = { url: url, timeout: timeout };
-    if ($environment?.params) {
+    
+    // 落地查询强制走当前节点
+    if (!direct && $environment?.params) {
       opts.opts = { policy: $environment.params };
     }
 
@@ -50,22 +56,58 @@ function fetchJson(url) {
   });
 }
 
-function buildResult(ipapi, ippure) {
-  const ip = ipapi.query;
-  const location = [ipapi.country, ipapi.regionName, ipapi.city].filter(Boolean).join(" · ");
-  const isp = ipapi.isp || ipapi.org || "未知";
-  const asn = ipapi.as || "";
+function getFlag(code) {
+  if (!code || code.length !== 2) return "";
+  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt()));
+}
 
-  let typeText = "";
+function buildResult(entry, exit) {
+  const flag = getFlag(exit.countryCode);
+  const loc = [exit.country, exit.regionName, exit.city].filter(Boolean).join(" ");
+  const isp = exit.isp || exit.org || "未知";
+
+  // 落地部分
+  let html = `
+<p>
+<b>落地 IP</b>: ${exit.query}<br>
+<b>位置</b>: ${flag} ${loc}<br>
+<b>运营商</b>: ${isp}
+</p>
+`;
+
+  // 入口部分（如果能获取到）
+  if (entry && entry.status === "success" && entry.query !== exit.query) {
+    const eFlag = getFlag(entry.countryCode);
+    const eLoc = [entry.country, entry.regionName, entry.city].filter(Boolean).join(" ");
+    const eIsp = entry.isp || entry.org || "未知";
+
+    html = `
+<p>
+<b>入口</b>: ${entry.query}<br>
+<b>位置</b>: ${eFlag} ${eLoc}<br>
+<b>运营商</b>: ${eIsp}
+</p>
+<br>
+` + html;
+  } else {
+    html = `
+<p>
+<b>入口</b>: 获取失败（QX限制）
+</p>
+<br>
+` + html;
+  }
+
+  // 家宽/机房判断
+  let typeText = "未知";
   let typeColor = "#8E8E93";
-
-  if (ipapi.mobile) {
+  if (exit.mobile) {
     typeText = "📱 移动网络";
     typeColor = "#007AFF";
-  } else if (ipapi.hosting) {
+  } else if (exit.hosting) {
     typeText = "🏢 机房 / 数据中心";
     typeColor = "#FF9500";
-  } else if (ipapi.proxy) {
+  } else if (exit.proxy) {
     typeText = "🛡️ 代理 / VPN";
     typeColor = "#FF3B30";
   } else {
@@ -73,25 +115,11 @@ function buildResult(ipapi, ippure) {
     typeColor = "#34C759";
   }
 
-  let pureExtra = "";
-  if (ippure && ippure.ip === ip) {
-    const res = ippure.isResidential ? "✅ 原生家宽" : "❌ 非原生 / 机房";
-    const score = ippure.fraudScore != null ? `风险分 ${ippure.fraudScore}` : "";
-    pureExtra = `<br><br><b>IPPure 补充</b><br>${res}${score ? " · " + score : ""}`;
-  }
-
-  return `
-<p>
-<b>出口 IP</b><br>${ip}<br><br>
-<b>位置</b><br>${location || "未知"}<br><br>
-<b>运营商</b><br>${isp}<br>
-${asn ? asn + "<br>" : ""}
-<br>
+  html += `
+<p style="margin-top:12px">
 <b style="color:${typeColor}">${typeText}</b>
-${pureExtra}
-</p>
-<p style="color:#8E8E93;font-size:12px;margin-top:12px">
-数据来源：ip-api.com${ippure ? " + IPPure" : ""}
 </p>
 `;
+
+  return html;
 }
