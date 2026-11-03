@@ -139,14 +139,40 @@ let content = ''
       PROXY_PRIVACY = `\n${PROXY_PRIVACY}`
     }
     let ENTRANCE = ''
+    let ENTRANCE_IPs = []
     if (ENTRANCE_IP) {
-      const { IP: resolvedIP } = await resolveDomain(ENTRANCE_IP, CN_IP)
+      const { IP: resolvedIP, IPv4s = [] } = await resolveDomain(ENTRANCE_IP, CN_IP)
       if (resolvedIP) {
-        $.log(`入口域名解析: ${ENTRANCE_IP} ➟ ${resolvedIP}`)
+        $.log(`入口域名解析: ${ENTRANCE_IP} ➟ ${resolvedIP}${IPv4s.length > 1 ? ` (全部: ${IPv4s.join(', ')})` : ''}`)
         ENTRANCE_IP = resolvedIP
       }
+      ENTRANCE_IPs = IPv4s
     }
-    if (ENTRANCE_IP && ENTRANCE_IP !== PROXY_IP) {
+    if (ENTRANCE_IPs.length > 1) {
+      // 入口域名有多个 IP: 全部查询并列出
+      const MAX_ENTRANCE = 6
+      const ips = ENTRANCE_IPs.slice(0, MAX_ENTRANCE)
+      const entranceDelay = parseFloat($.lodash_get(arg, 'ENTRANCE_DELAY') || 0)
+      $.log(`入口域名解析出 ${ENTRANCE_IPs.length} 个 IP, 等待 ${entranceDelay} 秒后逐个查询: ${ips.join(', ')}`)
+      if (entranceDelay) {
+        await $.wait(1000 * entranceDelay)
+      }
+      const lines = await Promise.all(
+        ips.map(async ip => {
+          const [{ CN_INFO: info1 = '', isCN = false } = {}, { PROXY_INFO: info2 = '' } = {}] = await Promise.all([
+            getDirectInfo(ip, $.lodash_get(arg, 'DOMESTIC_IPv4')),
+            getProxyInfo(ip, $.lodash_get(arg, 'LANDING_IPv4')),
+          ])
+          // 国内接口的国外 IP 解析过于离谱 只在判定为国内时采用
+          const info = info1 && isCN ? info1 : info2 || info1
+          return `${maskIP(ip) || '-'} ${maskAddr(compactInfo(info))}`.trim()
+        })
+      )
+      ENTRANCE = `入口 (${ENTRANCE_IPs.length} 个):\n${lines.map((l, i) => `${i + 1}. ${l}`).join('\n')}`
+      if (ENTRANCE_IPs.length > MAX_ENTRANCE) {
+        ENTRANCE = `${ENTRANCE}\n…其余 ${ENTRANCE_IPs.length - MAX_ENTRANCE} 个未显示`
+      }
+    } else if (ENTRANCE_IP && ENTRANCE_IP !== PROXY_IP) {
       const entranceDelay = parseFloat($.lodash_get(arg, 'ENTRANCE_DELAY') || 0)
       $.log(`入口: ${ENTRANCE_IP} 与落地 IP: ${PROXY_IP} 不一致, 等待 ${entranceDelay} 秒后查询入口`)
       if (entranceDelay) {
@@ -1360,7 +1386,7 @@ const DOMAIN_RESOLVERS = {
     if (answers.length === 0) {
       throw new Error('域名解析无结果')
     }
-    return answers[answers.length - 1].data
+    return answers.map(i => i.data)
   },
 
   cf: async function (domain, type) {
@@ -1382,7 +1408,7 @@ const DOMAIN_RESOLVERS = {
     if (answers.length === 0) {
       throw new Error('域名解析无结果')
     }
-    return answers[answers.length - 1].data
+    return answers.map(i => i.data)
   },
   ali: async function (domain, type, ecs) {
     const resp = await http({
@@ -1401,7 +1427,7 @@ const DOMAIN_RESOLVERS = {
     if (answers.length === 0) {
       throw new Error('域名解析无结果')
     }
-    return answers[answers.length - 1]
+    return answers
   },
   tencent: async function (domain, type) {
     const resp = await http({
@@ -1419,13 +1445,14 @@ const DOMAIN_RESOLVERS = {
     if (answers.length === 0 || String(answers) === '0') {
       throw new Error('域名解析无结果')
     }
-    return answers[answers.length - 1]
+    return answers
   },
 }
 async function resolveDomainLoon(domain) {
   const TIMEOUT = parseFloat($.lodash_get(arg, 'TIMEOUT') || 5)
   let IPv4
   let IPv6
+  let IPv4s = []
   try {
     const query = new Promise((resolve, reject) => {
       const options = { domain, protocol: 'auto', ...(TIMEOUT ? { timeout: (TIMEOUT + 1) * 1000 } : {}) }
@@ -1442,22 +1469,25 @@ async function resolveDomainLoon(domain) {
           new Promise((_, reject) => setTimeout(() => reject(new Error('DNS TIMEOUT')), TIMEOUT * 1000)),
         ])
       : query)
-    IPv4 = result.answers.find(i => i.type === 'A' && isIPv4(i.value))?.value
+    IPv4s = Array.from(new Set(result.answers.filter(i => i.type === 'A' && isIPv4(i.value)).map(i => i.value)))
+    IPv4 = IPv4s[0]
     IPv6 = result.answers.find(i => i.type === 'AAAA' && isIPv6(i.value))?.value
     if (!IPv4 && !IPv6) throw new Error('域名解析无结果')
   } catch (e) {
     $.logErr(`使用 Loon 解析域名 ${domain} 发生错误: ${e.message || e}`)
   }
-  return { IP: IPv4 || IPv6, IPv4, IPv6 }
+  return { IP: IPv4 || IPv6, IPv4, IPv6, IPv4s }
 }
 async function resolveDomain(domain, clientIP) {
   let IPv4
   let IPv6
+  let IPv4s = []
   // 用本机出口 IP 的 /24 作为 EDNS 客户端子网, 让按运营商/地区分线路的域名返回与当前网络一致的记录
   const ecs = isIPv4(clientIP) ? clientIP.replace(/\.\d+$/, '.0/24') : undefined
   if (ecs) $.log(`域名解析使用 EDNS 客户端子网: ${ecs}`)
   if (isIPv4(domain)) {
     IPv4 = domain
+    IPv4s = [domain]
   } else if (isIPv6(domain)) {
     IPv6 = domain
   } else {
@@ -1489,20 +1519,33 @@ async function resolveDomain(domain, clientIP) {
         }
       })(),
     ])
-    const [v4, v6] = res
+    // 解析器返回全部记录(数组), 这里只保留合法 IP 并去重
+    const [v4s, v6s] = res
+    const list4 = Array.from(new Set([].concat(v4s || []).filter(i => isIPv4(i))))
+    const list6 = Array.from(new Set([].concat(v6s || []).filter(i => isIPv6(i))))
 
-    if (isIPv4(v4)) {
-      IPv4 = v4
+    if (list4.length > 0) {
+      // 保持原有行为: 单个入口时取最后一条
+      IPv4 = list4[list4.length - 1]
+      IPv4s = list4
     } else {
       $.logErr(`${msg} 解析 IPv4 失败`)
     }
-    if (isIPv6(v6)) {
-      IPv6 = v6
+    if (list6.length > 0) {
+      IPv6 = list6[list6.length - 1]
     } else {
       $.logErr(`${msg} 解析 IPv6 失败`)
     }
   }
-  return { IP: IPv4 || IPv6, IPv4, IPv6 }
+  return { IP: IPv4 || IPv6, IPv4, IPv6, IPv4s }
+}
+// 把 "位置: 🇨🇳 上海\n运营商: 联通" 压成一行 "🇨🇳 上海 联通"
+function compactInfo(info) {
+  return String(info || '')
+    .split('\n')
+    .map(i => i.replace(/^.*?:\s*/, '').trim())
+    .filter(i => i)
+    .join(' ')
 }
 // source: https://stackoverflow.com/a/36760050
 const IPV4_REGEX = /^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)(\.(?!$)|$)){4}$/
