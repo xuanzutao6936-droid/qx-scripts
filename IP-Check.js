@@ -1,26 +1,58 @@
 /**
  * QX 节点入口 + 落地 IP 检测
- * 风格对齐网络信息查询
+ * 使用 get_server_description 获取真实入口
  */
 const timeout = 8000;
 
 (async () => {
   try {
-    // 1. 获取落地 IP（走当前节点）
-    const exit = await fetchJson("http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting");
-    
+    // 1. 获取入口 IP（节点服务器地址）
+    let entryIP = "";
+    let entryInfo = null;
+
+    if ($environment?.params) {
+      try {
+        const { ret, error } = await $configuration.sendMessage({
+          action: "get_server_description",
+          content: $environment.params
+        });
+        if (!error && ret) {
+          const proxyStr = Object.values(ret)[0] || "";
+          // 匹配 server=xxx:port 或 =xxx:port
+          const match = proxyStr.match(/=\s*([^,\s]+):\d+/);
+          if (match) {
+            entryIP = match[1];
+            // 如果是域名，尝试解析成 IP（可选）
+            if (!/^\d+\.\d+\.\d+\.\d+$/.test(entryIP)) {
+              // 域名暂时直接显示
+            }
+          }
+        }
+      } catch (e) {
+        console.log("获取入口失败:", e);
+      }
+    }
+
+    // 2. 获取落地 IP（走当前节点）
+    const exit = await fetchJson(
+      "http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting"
+    );
+
     if (!exit || exit.status !== "success") {
       throw new Error(exit?.message || "落地 IP 获取失败");
     }
 
-    // 2. 尝试获取入口 IP（节点服务器 IP）
-    let entry = null;
-    try {
-      // 这里用一个不走代理的接口尝试获取（效果有限，QX 限制较多）
-      entry = await fetchJson("http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as", true);
-    } catch (e) {}
+    // 3. 如果有入口 IP，再查一下入口的地理位置
+    if (entryIP && /^\d+\.\d+\.\d+\.\d+$/.test(entryIP)) {
+      try {
+        entryInfo = await fetchJson(
+          `http://ip-api.com/json/${entryIP}?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as`,
+          true
+        );
+      } catch (e) {}
+    }
 
-    const result = buildResult(entry, exit);
+    const result = buildResult(entryIP, entryInfo, exit);
     $done({
       title: "📍 节点入口/落地检测",
       htmlMessage: result
@@ -35,70 +67,80 @@ const timeout = 8000;
 
 function fetchJson(url, direct = false) {
   return new Promise((resolve, reject) => {
-    const opts = { url: url, timeout: timeout };
-    
-    // 落地查询强制走当前节点
+    const opts = { url, timeout };
     if (!direct && $environment?.params) {
       opts.opts = { policy: $environment.params };
     }
-
-    $task.fetch(opts).then(resp => {
-      if (resp.statusCode === 200 && resp.body) {
-        try {
-          resolve(JSON.parse(resp.body));
-        } catch (e) {
-          reject(new Error("JSON 解析失败"));
+    $task.fetch(opts).then(
+      (resp) => {
+        if (resp.statusCode === 200 && resp.body) {
+          try {
+            resolve(JSON.parse(resp.body));
+          } catch (e) {
+            reject(new Error("JSON 解析失败"));
+          }
+        } else {
+          reject(new Error(`HTTP ${resp.statusCode}`));
         }
-      } else {
-        reject(new Error(`HTTP ${resp.statusCode}`));
-      }
-    }, err => reject(err));
+      },
+      (err) => reject(err)
+    );
   });
 }
 
 function getFlag(code) {
   if (!code || code.length !== 2) return "";
-  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt()));
+  return String.fromCodePoint(
+    ...[...code.toUpperCase()].map((c) => 127397 + c.charCodeAt())
+  );
 }
 
-function buildResult(entry, exit) {
-  const flag = getFlag(exit.countryCode);
-  const loc = [exit.country, exit.regionName, exit.city].filter(Boolean).join(" ");
-  const isp = exit.isp || exit.org || "未知";
+function buildResult(entryIP, entryInfo, exit) {
+  let html = "";
 
-  // 落地部分
-  let html = `
+  // ===== 入口 =====
+  if (entryIP) {
+    const flag = entryInfo ? getFlag(entryInfo.countryCode) : "";
+    const loc = entryInfo
+      ? [entryInfo.country, entryInfo.regionName, entryInfo.city]
+          .filter(Boolean)
+          .join(" ")
+      : "解析中 / 域名";
+    const isp = entryInfo ? entryInfo.isp || entryInfo.org || "未知" : "未知";
+
+    html += `
 <p>
-<b>落地 IP</b>: ${exit.query}<br>
+<b>入口</b>: ${entryIP}<br>
 <b>位置</b>: ${flag} ${loc}<br>
 <b>运营商</b>: ${isp}
 </p>
+<br>
 `;
-
-  // 入口部分（如果能获取到）
-  if (entry && entry.status === "success" && entry.query !== exit.query) {
-    const eFlag = getFlag(entry.countryCode);
-    const eLoc = [entry.country, entry.regionName, entry.city].filter(Boolean).join(" ");
-    const eIsp = entry.isp || entry.org || "未知";
-
-    html = `
+  } else {
+    html += `
 <p>
-<b>入口</b>: ${entry.query}<br>
+<b>入口</b>: 获取失败
+</p>
+<br>
+`;
+  }
+
+  // ===== 落地 =====
+  const eFlag = getFlag(exit.countryCode);
+  const eLoc = [exit.country, exit.regionName, exit.city]
+    .filter(Boolean)
+    .join(" ");
+  const eIsp = exit.isp || exit.org || "未知";
+
+  html += `
+<p>
+<b>落地 IP</b>: ${exit.query}<br>
 <b>位置</b>: ${eFlag} ${eLoc}<br>
 <b>运营商</b>: ${eIsp}
 </p>
-<br>
-` + html;
-  } else {
-    html = `
-<p>
-<b>入口</b>: 获取失败（QX限制）
-</p>
-<br>
-` + html;
-  }
+`;
 
-  // 家宽/机房判断
+  // ===== 类型判断 =====
   let typeText = "未知";
   let typeColor = "#8E8E93";
   if (exit.mobile) {
@@ -116,7 +158,8 @@ function buildResult(entry, exit) {
   }
 
   html += `
-<p style="margin-top:12px">
+<br>
+<p>
 <b style="color:${typeColor}">${typeText}</b>
 </p>
 `;
