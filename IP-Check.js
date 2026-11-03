@@ -1,15 +1,14 @@
 /**
- * QX 节点入口 + 落地 IP 检测（最终版）
+ * QX 节点入口 + 落地 IP 检测
+ * 入口域名会自动解析成 IP
  */
 const timeout = 8000;
 
 (async () => {
   try {
     let entryHost = "";
-    let entryIP = "";
-    let entryInfo = null;
 
-    // 1. 获取入口（从节点配置解析）
+    // 1. 从节点配置里提取入口地址（可能是域名或 IP）
     if ($environment?.params) {
       try {
         const { ret, error } = await $configuration.sendMessage({
@@ -19,7 +18,6 @@ const timeout = 8000;
 
         if (!error && ret) {
           const proxyStr = Object.values(ret)[0] || "";
-          // 匹配 =域名或IP:端口
           const match = proxyStr.match(/=\s*([^,\s]+):\d+/);
           if (match) {
             entryHost = match[1];
@@ -39,24 +37,20 @@ const timeout = 8000;
       throw new Error(exit?.message || "落地 IP 获取失败");
     }
 
-    // 3. 如果入口是 IP，查询地理位置；如果是域名，直接显示域名
+    // 3. 解析入口（无论是域名还是 IP，都用 ip-api 查一次，拿到真实 IP + 位置）
+    let entryInfo = null;
     if (entryHost) {
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(entryHost)) {
-        // 纯 IP
-        entryIP = entryHost;
-        try {
-          entryInfo = await fetchJson(
-            `http://ip-api.com/json/${entryIP}?lang=zh-CN&fields=status,country,countryCode,regionName,city,isp,org,as`,
-            true
-          );
-        } catch (e) {}
-      } else {
-        // 域名，先显示域名，尝试解析（可选）
-        entryIP = entryHost;
+      try {
+        entryInfo = await fetchJson(
+          `http://ip-api.com/json/${entryHost}?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as`,
+          true // 直连查询，不走代理
+        );
+      } catch (e) {
+        console.log("入口解析失败", e);
       }
     }
 
-    const result = buildResult(entryIP, entryInfo, exit);
+    const result = buildResult(entryInfo, exit);
     $done({
       title: "📍 节点入口/落地检测",
       htmlMessage: result
@@ -99,23 +93,20 @@ function getFlag(code) {
   );
 }
 
-function buildResult(entry, entryInfo, exit) {
+function buildResult(entryInfo, exit) {
   let html = "";
 
   // ===== 入口 =====
-  if (entry) {
-    const isIP = /^\d{1,3}(\.\d{1,3}){3}$/.test(entry);
-    const flag = entryInfo ? getFlag(entryInfo.countryCode) : "";
-    const loc = entryInfo
-      ? [entryInfo.country, entryInfo.regionName, entryInfo.city].filter(Boolean).join(" ")
-      : isIP
-      ? "查询中"
-      : "域名";
-    const isp = entryInfo ? entryInfo.isp || entryInfo.org || "未知" : "未知";
+  if (entryInfo && entryInfo.status === "success") {
+    const flag = getFlag(entryInfo.countryCode);
+    const loc = [entryInfo.country, entryInfo.regionName, entryInfo.city]
+      .filter(Boolean)
+      .join(" ");
+    const isp = entryInfo.isp || entryInfo.org || "未知";
 
     html += `
 <p>
-<b>入口</b>: ${entry}<br>
+<b>入口</b>: ${entryInfo.query}<br>
 <b>位置</b>: ${flag} ${loc}<br>
 <b>运营商</b>: ${isp}
 </p>
@@ -124,7 +115,7 @@ function buildResult(entry, entryInfo, exit) {
   } else {
     html += `
 <p>
-<b>入口</b>: 获取失败
+<b>入口</b>: 解析失败
 </p>
 <br>
 `;
@@ -132,7 +123,9 @@ function buildResult(entry, entryInfo, exit) {
 
   // ===== 落地 =====
   const eFlag = getFlag(exit.countryCode);
-  const eLoc = [exit.country, exit.regionName, exit.city].filter(Boolean).join(" ");
+  const eLoc = [exit.country, exit.regionName, exit.city]
+    .filter(Boolean)
+    .join(" ");
   const eIsp = exit.isp || exit.org || "未知";
 
   html += `
