@@ -1,6 +1,6 @@
 /**
  * QX 节点入口 + 落地 IP 检测
- * 入口域名会自动解析成 IP
+ * 增强中转域名解析
  */
 const timeout = 8000;
 
@@ -8,49 +8,45 @@ const timeout = 8000;
   try {
     let entryHost = "";
 
-    // 1. 从节点配置里提取入口地址（可能是域名或 IP）
+    // 1. 从节点配置提取入口地址
     if ($environment?.params) {
       try {
         const { ret, error } = await $configuration.sendMessage({
           action: "get_server_description",
           content: $environment.params
         });
-
         if (!error && ret) {
           const proxyStr = Object.values(ret)[0] || "";
           const match = proxyStr.match(/=\s*([^,\s]+):\d+/);
-          if (match) {
-            entryHost = match[1];
-          }
+          if (match) entryHost = match[1];
         }
-      } catch (e) {
-        console.log("获取入口配置失败", e);
-      }
+      } catch (e) {}
     }
 
     // 2. 获取落地 IP
     const exit = await fetchJson(
       "http://ip-api.com/json?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting"
     );
-
     if (!exit || exit.status !== "success") {
       throw new Error(exit?.message || "落地 IP 获取失败");
     }
 
-    // 3. 解析入口（无论是域名还是 IP，都用 ip-api 查一次，拿到真实 IP + 位置）
+    // 3. 解析入口（多种方式尝试）
     let entryInfo = null;
     if (entryHost) {
-      try {
-        entryInfo = await fetchJson(
-          `http://ip-api.com/json/${entryHost}?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as`,
-          true // 直连查询，不走代理
-        );
-      } catch (e) {
-        console.log("入口解析失败", e);
+      // 方式1：ip-api 直接查域名
+      entryInfo = await tryResolve(entryHost);
+
+      // 方式2：如果失败，先用 DNS 解析成 IP，再查
+      if (!entryInfo) {
+        const resolvedIP = await resolveDomain(entryHost);
+        if (resolvedIP) {
+          entryInfo = await tryResolve(resolvedIP);
+        }
       }
     }
 
-    const result = buildResult(entryInfo, exit);
+    const result = buildResult(entryHost, entryInfo, exit);
     $done({
       title: "📍 节点入口/落地检测",
       htmlMessage: result
@@ -62,6 +58,42 @@ const timeout = 8000;
     });
   }
 })();
+
+async function tryResolve(host) {
+  try {
+    const data = await fetchJson(
+      `http://ip-api.com/json/${host}?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as`,
+      true
+    );
+    if (data && data.status === "success") return data;
+  } catch (e) {}
+  return null;
+}
+
+async function resolveDomain(domain) {
+  // 使用阿里 DNS 解析
+  try {
+    const data = await fetchJson(
+      `https://dns.alidns.com/resolve?name=${domain}&type=A`,
+      true
+    );
+    if (data && data.Answer && data.Answer.length > 0) {
+      for (const ans of data.Answer) {
+        if (ans.type === 1 && ans.data) return ans.data; // A 记录
+      }
+    }
+  } catch (e) {}
+
+  // 备用：360 DNS
+  try {
+    const data = await fetchJson(
+      `https://api./* 360dns 备用，如果需要可以再加 */`,
+      true
+    );
+  } catch (e) {}
+
+  return null;
+}
 
 function fetchJson(url, direct = false) {
   return new Promise((resolve, reject) => {
@@ -93,10 +125,10 @@ function getFlag(code) {
   );
 }
 
-function buildResult(entryInfo, exit) {
+function buildResult(entryHost, entryInfo, exit) {
   let html = "";
 
-  // ===== 入口 =====
+  // 入口
   if (entryInfo && entryInfo.status === "success") {
     const flag = getFlag(entryInfo.countryCode);
     const loc = [entryInfo.country, entryInfo.regionName, entryInfo.city]
@@ -115,13 +147,13 @@ function buildResult(entryInfo, exit) {
   } else {
     html += `
 <p>
-<b>入口</b>: 解析失败
+<b>入口</b>: ${entryHost || "获取失败"}（解析失败）<br>
 </p>
 <br>
 `;
   }
 
-  // ===== 落地 =====
+  // 落地
   const eFlag = getFlag(exit.countryCode);
   const eLoc = [exit.country, exit.regionName, exit.city]
     .filter(Boolean)
@@ -136,7 +168,7 @@ function buildResult(entryInfo, exit) {
 </p>
 `;
 
-  // ===== 类型判断 =====
+  // 类型
   let typeText = "未知";
   let typeColor = "#8E8E93";
   if (exit.mobile) {
